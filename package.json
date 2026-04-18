@@ -1,6 +1,9 @@
 {
   "name": "research",
   "private": true,
+  "scripts": {
+    "start": "bun run scrap3.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
