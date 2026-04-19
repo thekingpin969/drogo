@@ -18,28 +18,54 @@ const db = new Pool({
     max: 20, // default max capacity pool securely covering parallel concurrency locks
 });
 
-// ─── ScraperAPI Settings ────────────────────────────────────────────────────────
+// ─── ScraperAPI Persistent Dynamic Keys ──────────────────────────────────────
 
-// const SCRAPER_API_KEY = "cc71b1ba9f3ac895e55c266b8963fd2d";
-const SCRAPER_API_KEY_ARRAY = [
-    "c2253d2579c7308168cabab6f011ee9f",
-    "646bb84f70e30a90928e1e9ba70cc907",
-    "31650147d1fa794b9e03b0809e98aefd",
-    "94b2ef48baf218ea358949384041aa8d"
-]
+const MAX_KEY_CREDITS = 5000;
+const TRACKER_FILE = "scraper_keys_tracking.json";
 
-let currentApiKeyIndex = 0;
-
-function getNextApiKey(): any {
-    const key = SCRAPER_API_KEY_ARRAY[currentApiKeyIndex];
-    currentApiKeyIndex = (currentApiKeyIndex + 1) % SCRAPER_API_KEY_ARRAY.length;
-    return key;
+function getTrackerState(): Record<string, number> {
+    if (!fs.existsSync(TRACKER_FILE)) return {};
+    try {
+        return JSON.parse(fs.readFileSync(TRACKER_FILE, "utf-8"));
+    } catch {
+        return {};
+    }
 }
 
-function wrapScraperApi(targetUrl: string): string {
+function recordCreditUsage(usedKey: string) {
+    // Because Node.js handles sync methods blocking on a single thread,
+    // this inherently acts as a thread-safe mutex lock preventing Promise concurrency bugs.
+    const state = getTrackerState();
+    state[usedKey] = (state[usedKey] || 0) + 1;
+    fs.writeFileSync(TRACKER_FILE, JSON.stringify(state, null, 2), "utf-8");
+}
+
+function getNextApiKey(): string {
+    const rawKeys = process.env.SCRAPER_API_KEYS || "c2253d2579c7308168cabab6f011ee9f,646bb84f70e30a90928e1e9ba70cc907,31650147d1fa794b9e03b0809e98aefd,94b2ef48baf218ea358949384041aa8d";
+    const keyArray = rawKeys.split(",").map(k => k.trim()).filter(k => k.length > 0);
+
+    if (keyArray.length === 0) {
+        throw new Error("Fatal: No Scraper API Keys bounded. Please declare SCRAPER_API_KEYS environment variable!");
+    }
+
+    const state = getTrackerState();
+    for (const key of keyArray) {
+        const usage = state[key] || 0;
+        if (usage < MAX_KEY_CREDITS) {
+            return key; // Returns the first valid non-exhausted key
+        }
+    }
+
+    throw new Error("💀 CRITICAL STOP: ALL ScraperAPI keys have completely exhausted their 5,000 credit limit!");
+}
+
+function wrapScraperApi(targetUrl: string): { url: string; key: string } {
     const apiKey = getNextApiKey();
     const encoded = encodeURIComponent(targetUrl);
-    return `https://api.scraperapi.com/?api_key=${apiKey}&url=${encoded}&keep_headers=true&device_type=desktop`;
+    return {
+        url: `https://api.scraperapi.com/?api_key=${apiKey}&url=${encoded}&keep_headers=true&device_type=desktop`,
+        key: apiKey,
+    };
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -129,13 +155,13 @@ function buildFilters(
         dineoutAdsMetaData: {},
         appliedFilter: appliedFilter
             ? [
-                // {
-                //     filterType: "category_sheet",
-                //     filterValue: "delivery_home",
-                //     isHidden: true,
-                //     isApplied: true,
-                //     postKey: JSON.stringify({ category_context: "delivery_home" }),
-                // },
+                {
+                    filterType: "category_sheet",
+                    filterValue: "delivery_home",
+                    isHidden: true,
+                    isApplied: true,
+                    postKey: JSON.stringify({ category_context: "delivery_home" }),
+                },
                 {
                     filterType: "sort",
                     filterValue: "popularity_desc",
@@ -243,7 +269,8 @@ function extractSetCookie(setCookieHeaders: string[], name: string): string | nu
 async function fetchCsrf(city: CityConfig): Promise<CsrfResult> {
     const logPrefix = `[${city.cityName}]`;
     console.log(`${logPrefix} [1] Fetching CSRF token...`);
-    const res = await fetch(wrapScraperApi(`${BASE_URL}/webroutes/auth/csrf`), {
+    const wrap = wrapScraperApi(`${BASE_URL}/webroutes/auth/csrf`);
+    const res = await fetch(wrap.url, {
         headers: {
             accept: "*/*",
             "accept-language": "en-US,en;q=0.9",
@@ -256,6 +283,7 @@ async function fetchCsrf(city: CityConfig): Promise<CsrfResult> {
     if (!res.ok) {
         throw new Error(`CSRF fetch failed: ${res.status} ${res.statusText}`);
     }
+    recordCreditUsage(wrap.key);
 
     // Collect all Set-Cookie headers from the CSRF response
     const setCookieHeaders: string[] = [];
@@ -324,10 +352,12 @@ async function fetchPage(
 ): Promise<SearchResponse> {
     const bodyStr = JSON.stringify(buildRequestBody(city, meta));
     const headers = buildZomatoHeaders(csrf, sessionCookie, city);
-    const url = `${BASE_URL}/webroutes/search/home`;
+    const targetUrl = `${BASE_URL}/webroutes/search/home`;
+
+    const wrap = wrapScraperApi(targetUrl);
 
     // Direct request wrapped with ScraperAPI — use Bun's native fetch
-    const res = await fetch(wrapScraperApi(url), {
+    const res = await fetch(wrap.url, {
         method: "POST",
         headers,
         body: bodyStr,
@@ -340,14 +370,15 @@ async function fetchPage(
         );
     }
 
+    recordCreditUsage(wrap.key);
+
     return res.json() as Promise<SearchResponse>;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function scrapeLocation(
-    city: CityConfig,
-    allRestaurants: Restaurant[]
+    city: CityConfig
 ) {
     const logPrefix = `[${city.cityName}]`;
     console.log(`\n${logPrefix} 🍽  Zomato Scraper — Location Initialization (Lat: ${city.latitude}, Lng: ${city.longitude})`);
@@ -446,11 +477,11 @@ async function scrapeLocation(
                 }
             }
 
-            allRestaurants.push(r);
+            // Clean stripped pipeline: purely rely on the DB layer for saving!
             newCount++;
         }));
 
-        console.log(`${logPrefix}     ✓ Got ${newCount} on page (Upserted ${insertedToDb} entirely new to DB, instance memory array: ${allRestaurants.length})`);
+        console.log(`${logPrefix}     ✓ Got ${newCount} on page (Upserted ${insertedToDb} entirely new to DB independently)`);
 
         // Check pagination
         if (!newMeta || !newMeta.hasMore) {
@@ -506,8 +537,6 @@ async function scrapeLocation(
         `);
         console.log("🐘 Initialized PostgreSQL Database connection & ensured 'zomato_restaurants' table exists.");
 
-        const allRestaurants: Restaurant[] = [];
-        const masterFile = "zomato_kozhikode_master.json";
         const processedFile = "kozhikode_processed_locations.json";
 
         // Iterating cleanly through splits sequentially.
@@ -537,7 +566,7 @@ async function scrapeLocation(
 
                 try {
                     // Fire autonomous concurrent execution block
-                    await scrapeLocation(city, allRestaurants);
+                    await scrapeLocation(city);
 
                     // Successfully scraped! Save the location strictly for future references.
                     // Because Node.js handles readFileSync and writeFileSync entirely synchronously in the primary event loop thread, 
@@ -554,13 +583,11 @@ async function scrapeLocation(
                 }
             }));
 
-            // Force dump the centralized master checkpoint immediately after ALL parallel promises map for a single Split resolves.
-            fs.writeFileSync(masterFile, JSON.stringify(allRestaurants, null, 2), "utf-8");
-            console.log(`💾 Split #${splitId} globally resolved. Synced master checkpoint successfully with array length: ${allRestaurants.length}\n`);
+            console.log(`💾 Split #${splitId} globally resolved. Synced payload successfully directly to Postgres.\n`);
         }
 
-        console.log(`\n✅ Batch processing completely finished! Total dumped into file strictly via ScraperAPI concurrently: ${allRestaurants.length}`);
-        
+        console.log(`\n✅ Batch processing completely finished! All geographic locations successfully pushed into DB cleanly.`);
+
         await db.end();
         console.log(`🐘 PostgreSQL connection pool flushed securely.`);
     } catch (err) {
